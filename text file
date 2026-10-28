@@ -1,1 +1,10 @@
-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd0eXN1dWl4b3VxYWl5bWNqdWV5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMxNjg1NzcsImV4cCI6MjEwODc0NDU3N30.l9zn9gQhEgBT17d1kDXHpZE9nyxkYxA0DTSy5cvlezo
+use the below commands:
+
+cd your_project_location_on_laptop
+npm start
+
+if you see TLS error
+
+cd your_project_location_on_laptop
+$env:NODE_TLS_REJECT_UNAUTHORIZED='0'
+npm start
