@@ -570,6 +570,7 @@ async function loadHistory() {
 document.addEventListener('DOMContentLoaded', () => {
   setAuthMode();
   setupTabs();
+  setupAuthEvents();
   setupHoldButton();
 
   if (state.token) {

@@ -5,10 +5,26 @@ const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { randomUUID } = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
+require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-production';
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY;
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
+const USE_SUPABASE = Boolean(SUPABASE_URL && SUPABASE_SECRET_KEY);
+
+const supabase = USE_SUPABASE
+  ? createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+      },
+    })
+  : null;
+
 const DB_DIR = path.join(__dirname, 'data');
 const DB_PATH = path.join(DB_DIR, 'sos.db');
 
@@ -45,7 +61,29 @@ function all(sql, params = []) {
   });
 }
 
+function getSupabaseUserClient(token) {
+  if (!SUPABASE_URL) {
+    return null;
+  }
+
+  return createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY || SUPABASE_SECRET_KEY, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+    global: {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    },
+  });
+}
+
 async function initializeDatabase() {
+  if (USE_SUPABASE) {
+    return;
+  }
+
   const schema = `
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
@@ -105,12 +143,26 @@ function createToken(user) {
   return jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
 }
 
-function authenticated(req, res, next) {
+async function authenticated(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
 
   if (!token) {
     return res.status(401).json({ error: 'Authentication required' });
+  }
+
+  if (USE_SUPABASE) {
+    try {
+      const { data: { user }, error } = await supabase.auth.getUser(token);
+      if (error || !user) {
+        return res.status(401).json({ error: 'Invalid or expired token' });
+      }
+
+      req.user = { id: user.id, email: user.email };
+      return next();
+    } catch (error) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
   }
 
   try {
@@ -122,6 +174,46 @@ function authenticated(req, res, next) {
   }
 }
 
+async function createSupabaseUser(email, password) {
+  const { data: userData, error: userError } = await supabase.auth.admin.createUser({
+    email,
+    password,
+    email_confirm: true,
+    user_metadata: { source: 'she-shield' },
+  });
+
+  if (userError) {
+    throw userError;
+  }
+
+  if (!userData?.user) {
+    throw new Error('Account creation failed.');
+  }
+
+  const { data: sessionData, error: sessionError } = await supabase.auth.signInWithPassword({ email, password });
+
+  if (sessionError) {
+    throw sessionError;
+  }
+
+  return {
+    user: userData.user,
+    token: sessionData?.session?.access_token || null,
+  };
+}
+
+async function loginSupabaseUser(email, password) {
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) {
+    throw error;
+  }
+
+  return {
+    user: data.user,
+    token: data.session?.access_token || null,
+  };
+}
+
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(__dirname));
 
@@ -130,12 +222,20 @@ app.post('/api/register', async (req, res) => {
     const email = String(req.body.email || '').trim().toLowerCase();
     const password = String(req.body.password || '');
 
-    if (!email || !/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(email)) {
+    if (!email || !/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(email)) {
       return res.status(400).json({ error: 'Enter a valid email address.' });
     }
 
     if (password.length < 6) {
       return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+    }
+
+    if (USE_SUPABASE) {
+      const result = await createSupabaseUser(email, password);
+      return res.status(201).json({
+        token: result.token,
+        user: { id: result.user.id, email: result.user.email },
+      });
     }
 
     const existing = await get('SELECT id FROM users WHERE email = ?', [email]);
@@ -151,7 +251,8 @@ app.post('/api/register', async (req, res) => {
     return res.status(201).json({ token, user: { id: userId, email } });
   } catch (error) {
     console.error('Register error:', error);
-    return res.status(500).json({ error: 'Unable to create account.' });
+    const message = error?.message || 'Unable to create account.';
+    return res.status(400).json({ error: message });
   }
 });
 
@@ -159,6 +260,14 @@ app.post('/api/login', async (req, res) => {
   try {
     const email = String(req.body.email || '').trim().toLowerCase();
     const password = String(req.body.password || '');
+
+    if (USE_SUPABASE) {
+      const result = await loginSupabaseUser(email, password);
+      return res.json({
+        token: result.token,
+        user: { id: result.user.id, email: result.user.email },
+      });
+    }
 
     const user = await get('SELECT * FROM users WHERE email = ?', [email]);
     if (!user) {
@@ -174,11 +283,16 @@ app.post('/api/login', async (req, res) => {
     return res.json({ token, user: { id: user.id, email: user.email } });
   } catch (error) {
     console.error('Login error:', error);
-    return res.status(500).json({ error: 'Unable to sign in.' });
+    const message = error?.message || 'Unable to sign in.';
+    return res.status(400).json({ error: message });
   }
 });
 
 app.get('/api/session', authenticated, async (req, res) => {
+  if (USE_SUPABASE) {
+    return res.json({ user: { id: req.user.id, email: req.user.email } });
+  }
+
   const user = await get('SELECT id, email FROM users WHERE id = ?', [req.user.id]);
   if (!user) {
     return res.status(404).json({ error: 'User not found' });
@@ -188,6 +302,18 @@ app.get('/api/session', authenticated, async (req, res) => {
 
 app.get('/api/contacts', authenticated, async (req, res) => {
   try {
+    if (USE_SUPABASE) {
+      const userClient = getSupabaseUserClient(req.headers.authorization.slice(7));
+      const { data, error } = await userClient
+        .from('contacts')
+        .select('*')
+        .eq('user_id', req.user.id)
+        .order('created_at', { ascending: true });
+
+      if (error) throw error;
+      return res.json({ contacts: data || [] });
+    }
+
     const rows = await all('SELECT * FROM contacts WHERE user_id = ? ORDER BY created_at ASC', [req.user.id]);
     res.json({ contacts: rows });
   } catch (error) {
@@ -210,6 +336,18 @@ app.post('/api/contacts', authenticated, async (req, res) => {
       return res.status(400).json({ error: 'Enter a valid phone number with country code.' });
     }
 
+    if (USE_SUPABASE) {
+      const userClient = getSupabaseUserClient(req.headers.authorization.slice(7));
+      const { data, error } = await userClient
+        .from('contacts')
+        .insert([{ user_id: req.user.id, name, phone, relation }])
+        .select()
+        .single();
+
+      if (error) throw error;
+      return res.status(201).json({ contact: data });
+    }
+
     const contactId = randomUUID();
     await run(
       'INSERT INTO contacts (id, user_id, name, phone, relation) VALUES (?, ?, ?, ?, ?)',
@@ -226,6 +364,26 @@ app.post('/api/contacts', authenticated, async (req, res) => {
 
 app.delete('/api/contacts/:id', authenticated, async (req, res) => {
   try {
+    if (USE_SUPABASE) {
+      const userClient = getSupabaseUserClient(req.headers.authorization.slice(7));
+      const { data, error } = await userClient
+        .from('contacts')
+        .delete()
+        .eq('id', req.params.id)
+        .eq('user_id', req.user.id)
+        .select()
+        .single();
+
+      if (error) {
+        if (error.code === 'PGRST116') {
+          return res.status(404).json({ error: 'Contact not found.' });
+        }
+        throw error;
+      }
+
+      return res.json({ ok: true, contact: data });
+    }
+
     const contact = await get('SELECT * FROM contacts WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
     if (!contact) {
       return res.status(404).json({ error: 'Contact not found.' });
@@ -244,6 +402,27 @@ app.post('/api/alerts', authenticated, async (req, res) => {
     const lat = req.body.lat != null ? Number(req.body.lat) : null;
     const lng = req.body.lng != null ? Number(req.body.lng) : null;
     const accuracy = req.body.accuracy != null ? Number(req.body.accuracy) : null;
+
+    if (USE_SUPABASE) {
+      const userClient = getSupabaseUserClient(req.headers.authorization.slice(7));
+      const { data: alert, error } = await userClient
+        .from('sos_alerts')
+        .insert([{ user_id: req.user.id, status: 'active', lat, lng, accuracy }])
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      if (lat != null && lng != null) {
+        const { error: locationError } = await userClient
+          .from('sos_locations')
+          .insert([{ alert_id: alert.id, user_id: req.user.id, lat, lng, accuracy }]);
+
+        if (locationError) throw locationError;
+      }
+
+      return res.status(201).json({ alert });
+    }
 
     const alertId = randomUUID();
     await run(
@@ -268,6 +447,21 @@ app.post('/api/alerts', authenticated, async (req, res) => {
 
 app.get('/api/alerts/active', authenticated, async (req, res) => {
   try {
+    if (USE_SUPABASE) {
+      const userClient = getSupabaseUserClient(req.headers.authorization.slice(7));
+      const { data, error } = await userClient
+        .from('sos_alerts')
+        .select('*')
+        .eq('user_id', req.user.id)
+        .eq('status', 'active')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (error) throw error;
+      return res.json({ alert: data || null });
+    }
+
     const alert = await get(
       'SELECT * FROM sos_alerts WHERE user_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1',
       [req.user.id, 'active']
@@ -281,6 +475,19 @@ app.get('/api/alerts/active', authenticated, async (req, res) => {
 
 app.get('/api/alerts/history', authenticated, async (req, res) => {
   try {
+    if (USE_SUPABASE) {
+      const userClient = getSupabaseUserClient(req.headers.authorization.slice(7));
+      const { data, error } = await userClient
+        .from('sos_alerts')
+        .select('*')
+        .eq('user_id', req.user.id)
+        .order('created_at', { ascending: false })
+        .limit(30);
+
+      if (error) throw error;
+      return res.json({ alerts: data || [] });
+    }
+
     const alerts = await all(
       'SELECT * FROM sos_alerts WHERE user_id = ? ORDER BY created_at DESC LIMIT 30',
       [req.user.id]
@@ -294,17 +501,49 @@ app.get('/api/alerts/history', authenticated, async (req, res) => {
 
 app.post('/api/alerts/:id/location', authenticated, async (req, res) => {
   try {
-    const alert = await get('SELECT * FROM sos_alerts WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
-    if (!alert) {
-      return res.status(404).json({ error: 'Alert not found.' });
-    }
-
     const lat = Number(req.body.lat);
     const lng = Number(req.body.lng);
     const accuracy = req.body.accuracy != null ? Number(req.body.accuracy) : null;
 
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
       return res.status(400).json({ error: 'Latitude and longitude are required.' });
+    }
+
+    if (USE_SUPABASE) {
+      const userClient = getSupabaseUserClient(req.headers.authorization.slice(7));
+      const { data: alert, error: alertError } = await userClient
+        .from('sos_alerts')
+        .select('*')
+        .eq('id', req.params.id)
+        .eq('user_id', req.user.id)
+        .maybeSingle();
+
+      if (alertError) throw alertError;
+      if (!alert) {
+        return res.status(404).json({ error: 'Alert not found.' });
+      }
+
+      const { error: locationError } = await userClient
+        .from('sos_locations')
+        .insert([{ alert_id: req.params.id, user_id: req.user.id, lat, lng, accuracy }]);
+
+      if (locationError) throw locationError;
+
+      const { data: updatedAlert, error: updateError } = await userClient
+        .from('sos_alerts')
+        .update({ lat, lng, accuracy })
+        .eq('id', req.params.id)
+        .eq('user_id', req.user.id)
+        .select()
+        .single();
+
+      if (updateError) throw updateError;
+      return res.json({ alert: updatedAlert });
+    }
+
+    const alert = await get('SELECT * FROM sos_alerts WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
+    if (!alert) {
+      return res.status(404).json({ error: 'Alert not found.' });
     }
 
     await run(
@@ -327,6 +566,33 @@ app.post('/api/alerts/:id/location', authenticated, async (req, res) => {
 
 app.patch('/api/alerts/:id/resolved', authenticated, async (req, res) => {
   try {
+    if (USE_SUPABASE) {
+      const userClient = getSupabaseUserClient(req.headers.authorization.slice(7));
+      const { data: alert, error: fetchError } = await userClient
+        .from('sos_alerts')
+        .select('*')
+        .eq('id', req.params.id)
+        .eq('user_id', req.user.id)
+        .maybeSingle();
+
+      if (fetchError) throw fetchError;
+      if (!alert) {
+        return res.status(404).json({ error: 'Alert not found.' });
+      }
+
+      const resolvedAt = new Date().toISOString();
+      const { data: updatedAlert, error: updateError } = await userClient
+        .from('sos_alerts')
+        .update({ status: 'resolved', resolved_at: resolvedAt })
+        .eq('id', req.params.id)
+        .eq('user_id', req.user.id)
+        .select()
+        .single();
+
+      if (updateError) throw updateError;
+      return res.json({ alert: updatedAlert });
+    }
+
     const alert = await get('SELECT * FROM sos_alerts WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
     if (!alert) {
       return res.status(404).json({ error: 'Alert not found.' });
@@ -356,6 +622,9 @@ async function startServer() {
   await initializeDatabase();
   app.listen(PORT, () => {
     console.log(`SafeHer SOS server running on http://localhost:${PORT}`);
+    if (USE_SUPABASE) {
+      console.log('Using Supabase database and auth');
+    }
   });
 }
 
